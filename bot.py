@@ -3,7 +3,7 @@
 Интерактивная историческая игра-детектив
 
 Установка:
-    pip install python-telegram-bot==20.7
+    pip install python-telegram-bot==20.7 httpx
 
 Запуск:
     BOT_TOKEN=ваш_токен python bot.py
@@ -11,6 +11,8 @@
 
 import os
 import logging
+from io import BytesIO
+import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -20,81 +22,304 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────
-# ИЗОБРАЖЕНИЯ (реальные исторические фото)
-# ──────────────────────────────────────────
+# ══════════════════════════════════════════
+# ИЗОБРАЖЕНИЯ
+# ══════════════════════════════════════════
 IMAGES = {
-    "amber_room":    "https://upload.wikimedia.org/wikipedia/commons/thumb/7/7f/Amber_room_kolna.jpg/1280px-Amber_room_kolna.jpg",
-    "koenigsberg":   "https://upload.wikimedia.org/wikipedia/commons/thumb/8/80/Bundesarchiv_Bild_101I-209-0091-24%2C_K%C3%B6nigsberg%2C_Schlossteich.jpg/1280px-Bundesarchiv_Bild_101I-209-0091-24%2C_K%C3%B6nigsberg%2C_Schlossteich.jpg",
-    "castle_ruins":  "https://upload.wikimedia.org/wikipedia/commons/thumb/8/80/Koenigsberg_castle_1945.jpg/800px-Koenigsberg_castle_1945.jpg",
-    "amber_panel":   "https://upload.wikimedia.org/wikipedia/commons/thumb/3/39/Amber_room_panel.jpg/800px-Amber_room_panel.jpg",
-    "detective":     "https://upload.wikimedia.org/wikipedia/commons/thumb/5/5e/Sovetskie_vojska_v_Kenigsberge_1945.jpg/1280px-Sovetskie_vojska_v_Kenigsberge_1945.jpg",
-    "restored":      "https://upload.wikimedia.org/wikipedia/commons/thumb/6/60/Amber_Room_Tsarskoye_Selo_2.jpg/1280px-Amber_Room_Tsarskoye_Selo_2.jpg",
+    "amber_room":   "https://upload.wikimedia.org/wikipedia/commons/6/60/Amber_Room_Tsarskoye_Selo_2.jpg",
+    "koenigsberg":  "https://upload.wikimedia.org/wikipedia/commons/thumb/8/80/Bundesarchiv_Bild_101I-209-0091-24%2C_K%C3%B6nigsberg%2C_Schlossteich.jpg/1280px-Bundesarchiv_Bild_101I-209-0091-24%2C_K%C3%B6nigsberg%2C_Schlossteich.jpg",
+    "castle_ruins": "https://upload.wikimedia.org/wikipedia/commons/thumb/f/f5/RIAN_archive_44732_Soviet_troops_storm_Koenigsberg.jpg/1024px-RIAN_archive_44732_Soviet_troops_storm_Koenigsberg.jpg",
+    "amber_panel":  "https://upload.wikimedia.org/wikipedia/commons/6/60/Amber_Room_Tsarskoye_Selo_2.jpg",
+    "detective":    "https://upload.wikimedia.org/wikipedia/commons/thumb/f/f5/RIAN_archive_44732_Soviet_troops_storm_Koenigsberg.jpg/1024px-RIAN_archive_44732_Soviet_troops_storm_Koenigsberg.jpg",
+    "restored":     "https://upload.wikimedia.org/wikipedia/commons/6/60/Amber_Room_Tsarskoye_Selo_2.jpg",
 }
 
-# ──────────────────────────────────────────
+# ══════════════════════════════════════════
 # СОСТОЯНИЕ ИГРЫ
-# ──────────────────────────────────────────
-# user_id -> { score, scene, path, quiz_state }
+# ══════════════════════════════════════════
 user_states: dict[int, dict] = {}
 
 def get_state(uid: int) -> dict:
     if uid not in user_states:
-        user_states[uid] = {"score": 0, "scene": "start", "path": None, "quiz": {}}
+        user_states[uid] = {
+            "score": 0,
+            "scene": "start",
+            "path": None,
+            "answered": set(),
+        }
     return user_states[uid]
 
 def reset_state(uid: int):
-    user_states[uid] = {"score": 0, "scene": "start", "path": None, "quiz": {}}
+    user_states[uid] = {
+        "score": 0,
+        "scene": "start",
+        "path": None,
+        "answered": set(),
+    }
 
-# ──────────────────────────────────────────
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ──────────────────────────────────────────
-async def send_photo_safe(chat_id, context, url, caption=""):
-    """Отправляет фото; при ошибке — просто текст."""
+# ══════════════════════════════════════════
+# УТИЛИТЫ
+# ══════════════════════════════════════════
+
+async def fetch_photo(url: str):
     try:
-        await context.bot.send_photo(chat_id=chat_id, photo=url, caption=caption, parse_mode="HTML")
-    except Exception:
-        if caption:
-            await context.bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML")
+        async with httpx.AsyncClient(follow_redirects=True, timeout=12) as client:
+            r = await client.get(url, headers={
+                "User-Agent": "AmberRoomTelegramBot/1.0 (educational project)"
+            })
+            if r.status_code == 200:
+                return r.content
+    except Exception as e:
+        logger.warning(f"Фото не загружено: {url} — {e}")
+    return None
 
-async def send(update_or_cq, context, text, keyboard=None, photo_url=None):
-    """Универсальная отправка сообщения."""
+
+async def send(target, context, text: str, keyboard=None, photo_url: str = None):
     chat_id = (
-        update_or_cq.message.chat_id
-        if hasattr(update_or_cq, "message") and update_or_cq.message
-        else update_or_cq.effective_chat.id
+        target.message.chat_id
+        if hasattr(target, "message") and target.message
+        else target.effective_chat.id
     )
-    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+    markup = InlineKeyboardMarkup(keyboard) if keyboard else None
 
     if photo_url:
-        try:
-            await context.bot.send_photo(
-                chat_id=chat_id, photo=photo_url,
-                caption=text[:1024], parse_mode="HTML",
-                reply_markup=reply_markup
+        photo_bytes = await fetch_photo(photo_url)
+        sent = False
+        if photo_bytes:
+            try:
+                await context.bot.send_photo(
+                    chat_id=chat_id, photo=BytesIO(photo_bytes),
+                    caption=text[:1024], parse_mode="HTML", reply_markup=markup,
+                )
+                sent = True
+            except Exception as e:
+                logger.warning(f"send_photo bytes failed: {e}")
+        if not sent:
+            try:
+                await context.bot.send_photo(
+                    chat_id=chat_id, photo=photo_url,
+                    caption=text[:1024], parse_mode="HTML", reply_markup=markup,
+                )
+                sent = True
+            except Exception as e:
+                logger.warning(f"send_photo url failed: {e}")
+        if not sent:
+            await context.bot.send_message(
+                chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=markup
             )
-            if len(text) > 1024:
-                await context.bot.send_message(chat_id=chat_id, text=text[1024:], parse_mode="HTML")
-        except Exception:
-            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=reply_markup)
+        elif len(text) > 1024:
+            await context.bot.send_message(chat_id=chat_id, text=text[1024:], parse_mode="HTML")
     else:
-        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=reply_markup)
+        await context.bot.send_message(
+            chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=markup
+        )
 
-# ──────────────────────────────────────────
+
+# ══════════════════════════════════════════
+# КВИЗЫ — данные
+# Очки: только за правильный ответ в квизе, +10.
+# Повторное нажатие заблокировано.
+# Максимум: 9 вопросов × 10 = 90 очков.
+# ══════════════════════════════════════════
+
+QUIZ1 = [
+    {
+        "q": "❓ <b>Вопрос 1 / 3</b>\n\nКто заказал создание Янтарной комнаты?",
+        "opts": [
+            ("Пётр I, российский царь", False),
+            ("Фридрих I, король Пруссии", True),
+            ("Екатерина Великая", False),
+            ("Фридрих II (Великий)", False),
+        ],
+        "ok":  "✅ Верно! Янтарный кабинет заказал <b>Фридрих I</b> в 1701 году. Авторство проекта до сих пор спорно — называют Андреаса Шлютера или Иоганна Эозандера.",
+        "err": "❌ Нет. Кабинет заказал <b>Фридрих I, король Пруссии,</b> в 1701 году.",
+    },
+    {
+        "q": "❓ <b>Вопрос 2 / 3</b>\n\nКак Янтарная комната оказалась в России?",
+        "opts": [
+            ("Куплена Екатериной II", False),
+            ("Захвачена как военный трофей", False),
+            ("Создана в России по прусскому образцу", False),
+            ("Подарена Петру I в 1716 году", True),
+        ],
+        "ok":  "✅ Верно! В 1716 году прусский король подарил кабинет Петру I. Взамен Пруссия получила 55 гренадеров-великанов и кубок, вырезанный руками самого Петра.",
+        "err": "❌ Нет. Комната была <b>подарена Петру I</b> прусским королём в 1716 году.",
+    },
+    {
+        "q": "❓ <b>Вопрос 3 / 3</b>\n\nПочему Янтарную комнату не эвакуировали в 1941 году?",
+        "opts": [
+            ("Не успели из-за стремительного наступления", False),
+            ("Забыли включить в списки эвакуации", False),
+            ("Боялись, что хрупкий янтарь рассыплется", True),
+            ("Комендант проигнорировал приказ", False),
+        ],
+        "ok":  "✅ Верно! Главная причина — <b>хрупкость янтаря.</b> Панели законсервировали на месте, завернув в вату. Плюс: эвакуационные списки были изъяты заранее, и комната в них не значилась.",
+        "err": "❌ Нет. Главная причина — <b>хрупкость старого янтаря:</b> боялись, что при демонтаже он рассыплется.",
+    },
+]
+
+QUIZ2 = [
+    {
+        "q": "❓ <b>Вопрос 1 / 3</b>\n\nЧто произошло в ночь с 9 на 10 апреля 1945 года?",
+        "opts": [
+            ("Советские войска штурмовали замок", False),
+            ("Роде уничтожил документы", False),
+            ("Начался пожар — уже после капитуляции", True),
+            ("Ящики погружены на грузовики", False),
+        ],
+        "ok":  "✅ Верно! Пожар начался <b>после</b> капитуляции 9 апреля — именно это опровергает версию Роде о гибели комнаты в огне.",
+        "err": "❌ Нет. В ту ночь начался пожар — уже <b>после</b> капитуляции гарнизона.",
+    },
+    {
+        "q": "❓ <b>Вопрос 2 / 3</b>\n\nПочему Кох запретил вывозить ценности морем?",
+        "opts": [
+            ("Боялся британских субмарин", False),
+            ("После гибели «Вильгельма Густлоффа»", True),
+            ("Порты были заблокированы", False),
+            ("Личный запрет Гитлера", False),
+        ],
+        "ok":  "✅ Верно! В январе 1945 года советская подлодка потопила <b>«Вильгельм Густлофф»</b> с тысячами людей. После этого Кох запретил морской вывоз ценностей.",
+        "err": "❌ Нет. После гибели <b>«Вильгельма Густлоффа»</b> Кох запретил морской вывоз.",
+    },
+    {
+        "q": "❓ <b>Вопрос 3 / 3</b>\n\nКогда Кох лично убедился, что ящики ещё в замке?",
+        "opts": [
+            ("В декабре 1944 года", False),
+            ("В январе 1945 года", False),
+            ("30 марта 1945 года", True),
+            ("8 апреля 1945 года", False),
+        ],
+        "ok":  "✅ Верно! <b>30 марта 1945</b> — Кох лично спустился в подвалы и осмотрел ящики. Свидетель — Пауль Фейерабенд. До капитуляции оставалось 10 дней.",
+        "err": "❌ Нет. Кох приехал в замок <b>30 марта 1945 года</b> — за 10 дней до капитуляции.",
+    },
+]
+
+QUIZ3 = [
+    {
+        "q": "❓ <b>Вопрос 1 / 3</b>\n\nЧто сделал Роде, когда советские войска окружали Кёнигсберг?",
+        "opts": [
+            ("Бежал на Запад с частью ящиков", False),
+            ("Передал ключи советскому командованию", False),
+            ("Отказался покидать город", True),
+            ("Уничтожил документы и скрылся", False),
+        ],
+        "ok":  "✅ Верно! Роде <b>отказался эвакуироваться.</b> Историки считают это косвенным свидетельством: он не хотел уходить без комнаты — значит, знал, что она рядом.",
+        "err": "❌ Нет. Роде <b>остался в Кёнигсберге до конца,</b> отказавшись от эвакуации.",
+    },
+    {
+        "q": "❓ <b>Вопрос 2 / 3</b>\n\nКто такой Пауль Фейерабенд?",
+        "opts": [
+            ("Офицер СС, командовавший охраной замка", False),
+            ("Управляющий рестораном «Блютгерихт»", True),
+            ("Советский переводчик на допросах Роде", False),
+            ("Берлинский чиновник по эвакуации ценностей", False),
+        ],
+        "ok":  "✅ Верно! Фейерабенд — <b>управляющий рестораном «Блютгерихт»</b> при замке. Он свидетель визита Коха 30 марта и, по версии Мосякина, именно он передал ящики советскому офицеру.",
+        "err": "❌ Нет. Фейерабенд — <b>управляющий рестораном «Блютгерихт»</b> при Кёнигсбергском замке.",
+    },
+    {
+        "q": "❓ <b>Вопрос 3 / 3</b>\n\nЧто произошло с исследователем Георгом Штайном в 1987 году?",
+        "opts": [
+            ("Объявил, что нашёл комнату в шахте", False),
+            ("Опубликовал секретные архивы Штази", False),
+            ("Найден мёртвым при невыясненных обстоятельствах", True),
+            ("Передал материалы советскому правительству", False),
+        ],
+        "ok":  "✅ Верно! Штайн посвятил десятилетия поискам и вышел на след реальных документов. В 1987 году он был <b>найден мёртвым</b> при невыясненных обстоятельствах.",
+        "err": "❌ Нет. В 1987 году Штайн был найден <b>мёртвым при невыясненных обстоятельствах.</b>",
+    },
+]
+
+QUIZ4 = [
+    {
+        "q": "❓ <b>Финал, вопрос 1 / 3</b>\n\nКогда открылась воссозданная Янтарная комната?",
+        "opts": [
+            ("14 сентября 1995 года", False),
+            ("31 мая 2003 года", True),
+            ("9 мая 2005 года", False),
+            ("12 июня 2000 года", False),
+        ],
+        "ok":  "✅ Верно! <b>31 мая 2003 года.</b> Работа заняла 20 лет. Сорок мастеров восстанавливали шедевр по немногочисленным довоенным фотографиям.",
+        "err": "❌ Нет. Воссозданная комната открылась <b>31 мая 2003 года</b> после 20 лет работы.",
+    },
+    {
+        "q": "❓ <b>Финал, вопрос 2 / 3</b>\n\nЧто подтвердили архивы ФСБ в 2025 году?",
+        "opts": [
+            ("Роде лично уничтожил часть панелей", False),
+            ("Комната передана США в 1950 году", False),
+            ("Из Кёнигсберга ушёл «музейный эшелон» с маршрутом на Тюрингию", True),
+            ("Ящики утоплены в Балтийском море", False),
+        ],
+        "ok":  "✅ Верно! Архивы ФСБ (2025) подтвердили: весной 1945-го из Кёнигсберга вышел эшелон с «музейными ценностями» с тремя точками назначения в Тюрингии — первое официальное российское свидетельство.",
+        "err": "❌ Нет. Архивы ФСБ 2025 года подтвердили существование <b>«музейного эшелона»</b> с маршрутом на Тюрингию.",
+    },
+    {
+        "q": "❓ <b>Финал, вопрос 3 / 3</b>\n\nЧто обнаружили польские водолазы в 2020 году?",
+        "opts": [
+            ("Фрагменты янтарных панелей на дне", False),
+            ("Пароход «Карлсруэ» с запечатанными ящиками", True),
+            ("Подводную базу для хранения ценностей", False),
+            ("Документы с координатами тайника", False),
+        ],
+        "ok":  "✅ Верно! Обнаружен <b>пароход «Карлсруэ»</b> с запечатанными ящиками в трюме. Связь с Янтарной комнатой не доказана — но и не исключена.",
+        "err": "❌ Нет. Обнаружен <b>пароход «Карлсруэ»</b> с запечатанными ящиками в трюме.",
+    },
+]
+
+
+async def run_quiz(cq, context, data: str, quiz_list: list, prefix: str, next_cb: str):
+    uid = cq.from_user.id
+    state = get_state(uid)
+
+    if data.startswith(f"{prefix}_q"):
+        idx = int(data[len(f"{prefix}_q"):])
+        q = quiz_list[idx]
+        kb = [
+            [InlineKeyboardButton(label, callback_data=f"{prefix}_a{idx}_{i}")]
+            for i, (label, _) in enumerate(q["opts"])
+        ]
+        await send(cq, context, q["q"], kb)
+        return
+
+    if data.startswith(f"{prefix}_a"):
+        rest = data[len(f"{prefix}_a"):]
+        idx = int(rest.split("_")[0])
+        ans = int(rest.split("_")[1])
+        q = quiz_list[idx]
+
+        key = f"{prefix}_{idx}"
+        if key in state["answered"]:
+            await cq.answer("Вы уже ответили на этот вопрос.", show_alert=False)
+            return
+        state["answered"].add(key)
+
+        correct = q["opts"][ans][1]
+        if correct:
+            state["score"] += 10
+            text = q["ok"] + f"\n\n🏅 <b>+10 очков.</b> Счёт: {state['score']}"
+        else:
+            text = q["err"] + f"\n\nСчёт: {state['score']}"
+
+        next_idx = idx + 1
+        if next_idx < len(quiz_list):
+            kb = [[InlineKeyboardButton("Следующий вопрос →", callback_data=f"{prefix}_q{next_idx}")]]
+        else:
+            kb = [[InlineKeyboardButton("Продолжить →", callback_data=next_cb)]]
+        await send(cq, context, text, kb)
+
+
+# ══════════════════════════════════════════
 # СЦЕНЫ
-# ──────────────────────────────────────────
+# ══════════════════════════════════════════
 
 async def scene_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     reset_state(uid)
-    state = get_state(uid)
-    state["scene"] = "prologue"
-
     text = (
         "🕯 <b>ТАЙНА ЯНТАРНОЙ КОМНАТЫ</b>\n\n"
         "<i>Интерактивная историческая игра-детектив</i>\n\n"
         "12 сцен · 5 концовок · 3 квиза\n"
-        "Максимальный счёт: <b>55 очков</b>\n\n"
+        "Максимальный счёт: <b>90 очков</b>\n\n"
         "Ваши решения влияют на ход расследования. "
         "Следите за уликами — история не прощает невнимательности."
     )
@@ -104,6 +329,7 @@ async def scene_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def scene_prologue(cq, context):
     uid = cq.from_user.id
+    reset_state(uid)
     state = get_state(uid)
     state["scene"] = "prologue"
 
@@ -113,8 +339,8 @@ async def scene_prologue(cq, context):
         "Среди руин — то, что осталось от Королевского замка: закопчённые стены, выбитые витражи, обгоревшие балки.\n\n"
         "Штаб поручает тебе особое задание.\n\n"
         "─────────────────────────\n\n"
-        "Ты <b>следователь Особого отдела</b>. Тебе передают папку с грифом «Совершенно секретно». "
-        "Внутри — несколько листов и фотография. Тысячи янтарных панелей, мозаичные флорентийские вставки, "
+        "Ты — <b>следователь Особого отдела.</b> Тебе передают папку с грифом «Совершенно секретно». "
+        "Внутри — несколько листов и фотография: тысячи янтарных панелей, мозаичные флорентийские вставки, "
         "зеркала в янтарных рамах.\n\n"
         "<i>Подпись: «Восьмое чудо света — Янтарная комната. Местонахождение: неизвестно».</i>\n\n"
         "─────────────────────────\n\n"
@@ -122,302 +348,148 @@ async def scene_prologue(cq, context):
         "• 1701 — прусский король Фридрих I заказал янтарный кабинет\n"
         "• 1716 — подарен Петру I в обмен на 55 гренадеров-великанов\n"
         "• 1755 — украшает Екатерининский дворец в Царском Селе\n"
-        "• 1941 — немцы демонтируют комнату за 36 часов, 30 ящиков отправлены в Кёнигсберг\n"
+        "• 1941 — немцы демонтируют комнату за 36 часов, 30 ящиков уходят в Кёнигсберг\n"
         "• Апрель 1945 — Кёнигсберг пал. Комната исчезла.\n\n"
-        "📚 <i>Решение не эвакуировать комнату принято из-за риска рассыпания хрупкого янтаря.</i>"
+        "📚 <i>Решение не эвакуировать принято из-за риска рассыпания хрупкого янтаря.</i>"
     )
-    kb = [[InlineKeyboardButton("Приступить к делу →", callback_data="scene_quiz1_intro")]]
+    kb = [[InlineKeyboardButton("Приступить к делу →", callback_data="quiz1_intro")]]
     await send(cq, context, text, kb, IMAGES["detective"])
 
 
-# ══════════════════════════════════════════
-# КВИЗ К1: ИСТОРИЯ КОМНАТЫ
-# ══════════════════════════════════════════
-
-QUIZ1 = [
-    {
-        "q": "❓ <b>Вопрос 1 из 3</b>\n\nКто заказал создание Янтарной комнаты?",
-        "options": [
-            ("А) Пётр I, российский император", False),
-            ("Б) Фридрих I, король Пруссии", True),
-            ("В) Екатерина Великая", False),
-            ("Г) Фридрих II (Великий)", False),
-        ],
-        "explanation": (
-            "✅ <b>Верно!</b> Фридрих I заказал янтарный кабинет в 1701 году. "
-            "Авторство проекта спорно: называют либо Андреаса Шлютера, либо Иоганна Эозандера."
-        ),
-        "wrong": "❌ Не совсем. Янтарный кабинет заказал <b>Фридрих I, король Пруссии</b> в 1701 году.",
-    },
-    {
-        "q": "❓ <b>Вопрос 2 из 3</b>\n\nКак Янтарная комната оказалась в России?",
-        "options": [
-            ("А) Куплена Екатериной II", False),
-            ("Б) Захвачена как военный трофей", False),
-            ("В) Создана в России по прусскому образцу", False),
-            ("Г) Подарена Петру I в 1716 году", True),
-        ],
-        "explanation": (
-            "✅ <b>Верно!</b> В 1716 году прусский король Фридрих Вильгельм I подарил кабинет Петру I. "
-            "Взамен Пруссия получила 55 русских гренадеров-великанов и кубок, сделанный руками самого Петра."
-        ),
-        "wrong": "❌ Нет. Янтарная комната была <b>подарена Петру I</b> прусским королём в 1716 году.",
-    },
-    {
-        "q": "❓ <b>Вопрос 3 из 3</b>\n\nПочему Янтарную комнату не эвакуировали в 1941 году?",
-        "options": [
-            ("А) Не успели из-за стремительного наступления", False),
-            ("Б) Забыли включить в списки эвакуации", False),
-            ("В) Боялись, что хрупкий янтарь рассыплется", True),
-            ("Г) Комендант проигнорировал приказ", False),
-        ],
-        "explanation": (
-            "✅ <b>Верно!</b> Главная причина — хрупкость янтаря. Специалисты решили законсервировать "
-            "панели на месте, завернув в вату и бумагу. Плюс: предвоенные эвакуационные списки были "
-            "изъяты, и Янтарная комната в них не значилась."
-        ),
-        "wrong": "❌ Нет. Главная причина — <b>хрупкость старого янтаря</b>: боялись, что при демонтаже он рассыплется.",
-    },
-]
-
 async def scene_quiz1_intro(cq, context):
-    uid = cq.from_user.id
-    state = get_state(uid)
-    state["scene"] = "quiz1"
-    state["quiz"] = {"idx": 0, "phase": "question"}
-
     text = (
         "👴 <b>Архивариус преграждает дорогу</b>\n\n"
         "<i>«Прежде чем лезть в огонь — проверьте, знаете ли вы, что искать. "
         "Три вопроса. Быстро.»</i>\n\n"
-        "За каждый правильный ответ: <b>+10 очков</b>"
+        "<b>+10 очков</b> за каждый правильный ответ"
     )
     kb = [[InlineKeyboardButton("Готов! →", callback_data="quiz1_q0")]]
     await send(cq, context, text, kb)
 
 
-async def handle_quiz1(cq, context, data):
-    uid = cq.from_user.id
-    state = get_state(uid)
-
-    if data.startswith("quiz1_q"):
-        idx = int(data.split("quiz1_q")[1])
-        q = QUIZ1[idx]
-        kb = []
-        for i, (label, _) in enumerate(q["options"]):
-            kb.append([InlineKeyboardButton(label, callback_data=f"quiz1_a{idx}_{i}")])
-        await send(cq, context, q["q"], kb)
-
-    elif data.startswith("quiz1_a"):
-        parts = data.split("_")
-        idx = int(parts[1][1:])
-        ans = int(parts[2])
-        q = QUIZ1[idx]
-        correct = q["options"][ans][1]
-
-        if correct:
-            state["score"] += 10
-            text = q["explanation"] + f"\n\n🏅 <b>+10 очков!</b> Счёт: {state['score']}"
-        else:
-            text = q["wrong"] + f"\n\nСчёт: {state['score']}"
-
-        next_idx = idx + 1
-        if next_idx < len(QUIZ1):
-            kb = [[InlineKeyboardButton("Следующий вопрос →", callback_data=f"quiz1_q{next_idx}")]]
-        else:
-            kb = [[InlineKeyboardButton("К расследованию →", callback_data="scene_r1")]]
-        await send(cq, context, text, kb)
-
-
-# ══════════════════════════════════════════
-# РАЗВИЛКА Р1
-# ══════════════════════════════════════════
-
 async def scene_r1(cq, context):
-    uid = cq.from_user.id
-    state = get_state(uid)
-    state["scene"] = "r1"
-
     text = (
         "🚬 <b>Кабинет майора Волкова</b>\n\n"
         "<i>«Ситуация следующая: комната исчезла, директор замковых коллекций "
         "Альфред Роде задержан. Он утверждает, что всё сгорело в пожаре. "
-        "Есть и другой свидетель — некий Фейерабенд, управляющий рестораном при замке. "
+        "Есть другой свидетель — некий Фейерабенд, управляющий рестораном при замке. "
         "Его показания противоречат словам Роде.</i>\n\n"
         "<i>С чего начнёте, следователь?»</i>\n\n"
         "— Майор Волков"
     )
     kb = [
-        [InlineKeyboardButton("👥 Путь А: Допросы свидетелей", callback_data="scene_a1")],
-        [InlineKeyboardButton("📁 Путь Б: Изучить документы", callback_data="scene_b1")],
+        [InlineKeyboardButton("👥 Путь А: Допросы", callback_data="scene_a1")],
+        [InlineKeyboardButton("📁 Путь Б: Документы", callback_data="scene_b1")],
     ]
     await send(cq, context, text, kb, IMAGES["castle_ruins"])
 
 
-# ══════════════════════════════════════════
-# ПУТЬ А: ДОПРОСЫ
-# ══════════════════════════════════════════
+# ── ПУТЬ А ───────────────────────────────
 
 async def scene_a1(cq, context):
     uid = cq.from_user.id
-    state = get_state(uid)
-    state["path"] = "A"
-    state["scene"] = "a1"
-
+    get_state(uid)["path"] = "A"
     text = (
         "📂 <b>Досье Роде</b>\n\n"
         "<b>Роде, Альфред Эрнст.</b> 1892 г.р. Директор художественных собраний Кёнигсберга. "
-        "С ноября 1941 — главный хранитель Янтарной комнаты в Кёнигсбергском замке.\n\n"
-        "Во время британских бомбардировок августа 1944 года проводил ночи в подвале рядом с ящиками. "
-        "Когда из Берлина пришёл приказ Бормана об эвакуации — прибегал к затягиванию, саботажу.\n\n"
-        "В январе 1945 — попытка вывоза через Южный вокзал. Провал: железнодорожное сообщение прервано.\n\n"
-        "<b>Ключевой факт:</b> когда советские войска окружали Кёнигсберг, Роде отказался уезжать. "
-        "Остался в городе до конца.\n\n"
+        "С ноября 1941 — главный хранитель Янтарной комнаты.\n\n"
+        "Во время бомбардировок августа 1944 проводил ночи в подвале рядом с ящиками. "
+        "Когда из Берлина пришёл приказ Бормана об эвакуации — прибегал к затягиванию и саботажу.\n\n"
+        "В январе 1945 — попытка вывоза через Южный вокзал. Провал: сообщение прервано.\n\n"
+        "<b>Ключевой факт:</b> когда советские войска окружали Кёнигсберг, Роде отказался уезжать.\n\n"
         "📚 <i>Последнее письмо Роде датировано 2 сентября 1944 года: комната цела, полная сохранность.</i>"
     )
-    kb = [[InlineKeyboardButton("Идти на допрос →", callback_data="scene_a2_choice1")]]
+    kb = [[InlineKeyboardButton("На допрос →", callback_data="scene_a2_c1")]]
     await send(cq, context, text, kb)
 
 
-async def scene_a2_choice1(cq, context):
-    uid = cq.from_user.id
-    state = get_state(uid)
-    state["scene"] = "a2_c1"
-
+async def scene_a2_c1(cq, context):
     text = (
         "🪑 <b>Комната для допросов</b>\n\n"
-        "Роде сидит напротив. Пожилой, бледный. Руки спокойно сложены на столе — слишком спокойно.\n\n"
-        "<b>Выберите тактику допроса:</b>"
+        "Роде сидит напротив. Пожилой, бледный. Руки сложены на столе — слишком спокойно.\n\n"
+        "<b>Выберите тактику:</b>"
     )
     kb = [
-        [InlineKeyboardButton("⚡ Давить: «Пожар начался уже после капитуляции»", callback_data="a2_c1_A")],
-        [InlineKeyboardButton("💬 Разговорить: «Расскажите о комнате…»", callback_data="a2_c1_B")],
+        [InlineKeyboardButton("⚡ Давить напрямую", callback_data="a2c1_press")],
+        [InlineKeyboardButton("💬 Сначала разговорить", callback_data="a2c1_talk")],
     ]
     await send(cq, context, text, kb)
 
 
-async def handle_a2_c1(cq, context, data):
+async def handle_a2c1(cq, context, ans: str):
     uid = cq.from_user.id
     state = get_state(uid)
-    correct = data == "a2_c1_A"
+    if "a2c1" in state["answered"]:
+        await cq.answer("Вы уже сделали этот выбор.", show_alert=False)
+        return
+    state["answered"].add("a2c1")
 
-    if correct:
-        state["score"] += 5
+    if ans == "press":
         text = (
             "⚡ <b>Тактика: давление</b>\n\n"
             "Роде вздрагивает, но быстро берёт себя в руки.\n\n"
-            "<i>«Я отвечал на эти вопросы. Комната сгорела. Я видел обгоревшие янтарные фрагменты.»</i>\n"
+            "<i>«Я отвечал на эти вопросы. Комната сгорела. Я видел обгоревшие фрагменты».»</i>\n"
             "— Альфред Роде\n\n"
             "Формально он прав — советская комиссия зафиксировала следы пожара. "
-            "Но человек, ночевавший в подвале рядом с ящиками, не мог так легко принять их гибель. "
-            "Что-то не так.\n\n"
-            f"✅ <b>+5 очков</b> за верную тактику! Счёт: {state['score']}"
+            "Но человек, ночевавший в подвале рядом с ящиками, не мог так легко принять их гибель."
         )
     else:
         text = (
             "💬 <b>Тактика: разговорить</b>\n\n"
-            "Роде медленно поднимает взгляд.\n\n"
-            "<i>«При правильном освещении — будто солнце осталось внутри стен. В августе сорок четвёртого, "
-            "когда бомбы падали, я спускался в подвал и просто сидел рядом с ящиками.»</i>\n"
+            "<i>«При правильном освещении — будто солнце осталось внутри стен. В августе сорок "
+            "четвёртого, когда бомбы падали, я спускался в подвал и просто сидел рядом с ящиками».»</i>\n"
             "— Альфред Роде\n\n"
-            "Пауза. <i>«Вы спрашиваете, где она. Я говорю вам: она сгорела. Я видел пепел.»</i>\n\n"
-            "Но ты замечаешь: он говорит о комнате слишком легко. Как будто — заученно."
+            "Пауза. <i>«Вы спрашиваете, где она. Я говорю вам: она сгорела».»</i>\n\n"
+            "Ты замечаешь: он говорит о комнате слишком легко. Как будто — заученно."
         )
-
-    kb = [[InlineKeyboardButton("Предъявить улику →", callback_data="scene_a2_choice2")]]
+    kb = [[InlineKeyboardButton("Предъявить улику →", callback_data="scene_a2_c2")]]
     await send(cq, context, text, kb)
 
 
-async def scene_a2_choice2(cq, context):
+async def scene_a2_c2(cq, context):
     text = (
-        "📄 <b>У тебя в руках фотокопия письма Роде — 2 сентября 1944 года.</b>\n\n"
-        "Как использовать улику?"
+        "📄 <b>Письмо Роде от 2 сентября 1944 года</b>\n\n"
+        "Фотокопия у тебя в руках. Как использовать?"
     )
     kb = [
-        [InlineKeyboardButton("📋 Показать письмо: «Комната была цела. Когда сгорела?»", callback_data="a2_c2_A")],
-        [InlineKeyboardButton("👤 Упомянуть свидетеля: «Фейерабенд видел ящики»", callback_data="a2_c2_B")],
+        [InlineKeyboardButton("📋 Предъявить письмо напрямую", callback_data="a2c2_letter")],
+        [InlineKeyboardButton("👤 Назвать имя Фейерабенда", callback_data="a2c2_witness")],
     ]
     await send(cq, context, text, kb)
 
 
-async def handle_a2_c2(cq, context, data):
+async def handle_a2c2(cq, context, ans: str):
     uid = cq.from_user.id
     state = get_state(uid)
-    correct = data == "a2_c2_A"
+    if "a2c2" in state["answered"]:
+        await cq.answer("Вы уже сделали этот выбор.", show_alert=False)
+        return
+    state["answered"].add("a2c2")
 
-    if correct:
-        state["score"] += 5
+    if ans == "letter":
         text = (
             "📋 <b>Письмо на столе</b>\n\n"
-            "<i>«Пожар произошёл в ночь на десятое апреля. Ящики стояли в залах, которые выгорели.»</i>\n"
+            "<i>«Пожар произошёл в ночь на десятое апреля. Ящики стояли в залах, которые выгорели».»</i>\n"
             "— Роде\n\n"
-            "<i>«Но девятого апреля гарнизон капитулировал, а пожар, по нашим данным, начался уже после. "
-            "Когда ящики, согласно другим показаниям, были уже переданы.»</i>\n"
+            "<i>«Но девятого апреля гарнизон капитулировал. Пожар, по нашим данным, начался после».»</i>\n"
             "— Следователь\n\n"
             "Роде смотрит на стол. Молчит.\n\n"
-            "📚 <i>Профессор Брюсов впоследствии установил: пожар начался ПОСЛЕ капитуляции гарнизона.</i>\n\n"
-            f"✅ <b>+5 очков!</b> Счёт: {state['score']}"
+            "📚 <i>Профессор Брюсов установил: пожар начался ПОСЛЕ капитуляции гарнизона.</i>"
         )
     else:
         text = (
             "👤 <b>Имя Фейерабенда</b>\n\n"
-            "<i>«Кто это сказал вам?»</i> — Роде чуть напрягается.\n"
-            "<i>«Пауль Фейерабенд.»</i>\n\n"
-            "Роде опускает голову. Молчание затягивается. "
-            "Это не поза человека, которому нечего скрывать.\n\n"
-            "📚 <i>Альфред Роде исчез в конце 1945 года при невыясненных обстоятельствах. "
-            "Официально — умер от тифа. Документов, подтверждающих смерть, не обнаружено.</i>"
+            "<i>«Кто это сказал вам?»</i>\n\n"
+            "<i>«Пауль Фейерабенд».»</i>\n\n"
+            "Роде опускает голову. Молчание затягивается.\n\n"
+            "📚 <i>Роде исчез в конце 1945 года. Официально — умер от тифа. "
+            "Документов, подтверждающих смерть, не обнаружено.</i>"
         )
-
-    kb = [[InlineKeyboardButton("К квизу о Кёнигсберге →", callback_data="scene_quiz2_intro")]]
+    kb = [[InlineKeyboardButton("Квиз: Кёнигсберг →", callback_data="quiz2_intro")]]
     await send(cq, context, text, kb)
 
 
-# ══════════════════════════════════════════
-# КВИЗ К2: КЁНИГСБЕРГ
-# ══════════════════════════════════════════
-
-QUIZ2 = [
-    {
-        "q": "❓ <b>Вопрос 1 из 3</b>\n\nЧто произошло в ночь с 9 на 10 апреля 1945 года в замке?",
-        "options": [
-            ("А) Советские войска штурмовали замок", False),
-            ("Б) Роде уничтожил документы", False),
-            ("В) Начался пожар уже после капитуляции гарнизона", True),
-            ("Г) Ящики погружены на грузовики", False),
-        ],
-        "explanation": "✅ Пожар начался <b>после</b> капитуляции 9 апреля — именно это опровергает версию Роде о гибели комнаты в огне.",
-        "wrong": "❌ Нет. В ту ночь в замке начался пожар — уже <b>после</b> капитуляции гарнизона.",
-    },
-    {
-        "q": "❓ <b>Вопрос 2 из 3</b>\n\nПочему Эрих Кох запретил вывозить ценности морем?",
-        "options": [
-            ("А) Боялся британских подводных лодок", False),
-            ("Б) После гибели «Вильгельма Густлоффа»", True),
-            ("В) Порты были заблокированы", False),
-            ("Г) Гитлер лично запретил эвакуацию", False),
-        ],
-        "explanation": "✅ В январе 1945 года советская подлодка потопила «Вильгельм Густлофф» с тысячами людей. После этого Кох запретил морской вывоз ценностей.",
-        "wrong": "❌ Нет. После гибели «Вильгельма Густлоффа» в январе 1945 года Кох запретил морской вывоз.",
-    },
-    {
-        "q": "❓ <b>Вопрос 3 из 3</b>\n\nКогда Эрих Кох лично убедился, что ящики ещё в замке?",
-        "options": [
-            ("А) В декабре 1944 года", False),
-            ("Б) В январе 1945 года", False),
-            ("В) 30 марта 1945 года", True),
-            ("Г) 8 апреля 1945 года", False),
-        ],
-        "explanation": "✅ <b>30 марта 1945 года</b> — Кох лично спустился в подвалы и осмотрел ящики. Свидетель — Пауль Фейерабенд. До капитуляции оставалось 10 дней.",
-        "wrong": "❌ Нет. Кох приехал в замок <b>30 марта 1945 года</b> — за 10 дней до капитуляции.",
-    },
-]
-
 async def scene_quiz2_intro(cq, context):
-    uid = cq.from_user.id
-    state = get_state(uid)
-    state["quiz"] = {"idx": 0}
-
     text = (
         "👴 <i>Архивариус догоняет тебя в коридоре.</i>\n\n"
         "<i>«Три вопроса о Кёнигсберге. Не пропустите детали — они часто решают всё.»</i>\n\n"
@@ -427,203 +499,109 @@ async def scene_quiz2_intro(cq, context):
     await send(cq, context, text, kb)
 
 
-async def handle_quiz2(cq, context, data):
-    uid = cq.from_user.id
-    state = get_state(uid)
-
-    if data.startswith("quiz2_q"):
-        idx = int(data.split("quiz2_q")[1])
-        q = QUIZ2[idx]
-        kb = []
-        for i, (label, _) in enumerate(q["options"]):
-            kb.append([InlineKeyboardButton(label, callback_data=f"quiz2_a{idx}_{i}")])
-        await send(cq, context, q["q"], kb)
-
-    elif data.startswith("quiz2_a"):
-        parts = data.split("_")
-        idx = int(parts[1][1:])
-        ans = int(parts[2])
-        q = QUIZ2[idx]
-        correct = q["options"][ans][1]
-
-        if correct:
-            state["score"] += 10
-            text = q["explanation"] + f"\n\n🏅 <b>+10 очков!</b> Счёт: {state['score']}"
-        else:
-            text = q["wrong"] + f"\n\nСчёт: {state['score']}"
-
-        next_idx = idx + 1
-        if next_idx < len(QUIZ2):
-            kb = [[InlineKeyboardButton("Следующий вопрос →", callback_data=f"quiz2_q{next_idx}")]]
-        else:
-            # После квиза К2 (путь А) переходим к улике А3
-            kb = [[InlineKeyboardButton("Изучить письмо Роде →", callback_data="scene_a3")]]
-        await send(cq, context, text, kb)
-
-
 async def scene_a3(cq, context):
-    uid = cq.from_user.id
-    state = get_state(uid)
-    state["scene"] = "a3"
-
     text = (
-        "📜 <b>Улика: письмо Роде, 2 сентября 1944 года</b>\n\n"
-        "Роде сообщает в Берлинский штаб: замок получил повреждения при бомбардировке, "
+        "📜 <b>Письмо Роде, 2 сентября 1944 года</b>\n\n"
+        "Роде сообщает в Берлин: замок повреждён при бомбардировке, "
         "янтарная комната демонтирована и убрана в подвалы. "
         "<b>Состояние — полная сохранность.</b>\n\n"
         "Это последний задокументированный след. После — тишина.\n\n"
-        "<b>Как интерпретировать письмо?</b>"
+        "<b>Как интерпретировать?</b>"
     )
     kb = [
-        [InlineKeyboardButton("📍 «Ящики в подвалах на 2 сент. 1944. Ищем, что было между сент. 44 и апр. 45»", callback_data="a3_A")],
-        [InlineKeyboardButton("🤔 «Письмо могло быть для отчётности. Роде скрывал правду»", callback_data="a3_B")],
+        [InlineKeyboardButton("📍 Ящики целы на сент. 44 — ищем что было дальше", callback_data="a3_good")],
+        [InlineKeyboardButton("🤔 Письмо могло быть написано для отчётности", callback_data="a3_bad")],
     ]
     await send(cq, context, text, kb)
 
 
-async def handle_a3(cq, context, data):
+async def handle_a3(cq, context, ans: str):
     uid = cq.from_user.id
     state = get_state(uid)
-    correct = data == "a3_A"
+    if "a3" in state["answered"]:
+        await cq.answer("Вы уже сделали этот выбор.", show_alert=False)
+        return
+    state["answered"].add("a3")
 
-    if correct:
-        state["score"] += 5
+    if ans == "good":
         text = (
             "📍 <b>Верное направление</b>\n\n"
-            "Хронология теперь чёткая:\n"
-            "• Сентябрь 1944 — ящики в подвалах замка ✓\n"
-            "• Январь 1945 — попытка вывоза через вокзал — провал ✓\n"
+            "Хронология чёткая:\n"
+            "• Сент. 1944 — ящики в подвалах замка ✓\n"
+            "• Янв. 1945 — попытка вывоза через вокзал — провал ✓\n"
             "• 30 марта 1945 — Кох видел ящики лично ✓\n"
-            "• 10 апреля 1945 — пожар (после капитуляции!) ✓\n\n"
-            "<b>Исчезновение произошло между 30 марта и 10 апреля 1945 года.</b> "
-            "Вот 10 дней, которые нужно объяснить.\n\n"
-            f"✅ <b>+5 очков!</b> Счёт: {state['score']}"
+            "• 10 апр. 1945 — пожар (после капитуляции!) ✓\n\n"
+            "<b>Исчезновение — между 30 марта и 10 апреля 1945 года.</b>"
         )
     else:
         text = (
             "🤔 Скептицизм полезен, но без замены отброшенной улики — это тупик.\n\n"
             "Без документальных подтверждений версия о фальсификации повисает в воздухе."
         )
-
     kb = [[InlineKeyboardButton("К главной развилке →", callback_data="scene_r2")]]
     await send(cq, context, text, kb)
 
 
-# ══════════════════════════════════════════
-# ПУТЬ Б: ДОКУМЕНТЫ
-# ══════════════════════════════════════════
+# ── ПУТЬ Б ───────────────────────────────
 
 async def scene_b1(cq, context):
     uid = cq.from_user.id
-    state = get_state(uid)
-    state["path"] = "B"
-    state["scene"] = "b1"
-
+    get_state(uid)["path"] = "B"
     text = (
         "📦 <b>Архивная комната замка</b>\n\n"
         "Запах гари, мокрой бумаги и пыли. Большинство документов уничтожено. "
-        "Но под обломками найдены три папки.\n\n"
+        "Под обломками найдены три папки.\n\n"
         "<b>📁 Папка 1.</b> Инвентарная опись, ноябрь 1941. "
-        "Тридцать ящиков с янтарными панелями, каждый пронумерован, опечатан. "
-        "Последняя запись: «Август 1944 — перемещение в подвальные помещения».\n\n"
-        "<b>📁 Папка 2.</b> Приказ из Берлина, конец 1944. Подпись: Мартин Борман — "
+        "Тридцать ящиков, каждый пронумерован и опечатан. "
+        "Последняя запись: «Август 1944 — перемещение в подвалы».\n\n"
+        "<b>📁 Папка 2.</b> Приказ Мартина Бормана, конец 1944 — "
         "«Эвакуировать янтарные ценности». Поверх карандашом: <i>«Исполнение затягивается».</i>\n\n"
-        "<b>📁 Папка 3.</b> Записи Роде, январь 1945. "
-        "«Попытка вывоза через Южный вокзал. Железнодорожное сообщение прервано. Ящики возвращены».\n\n"
+        "<b>📁 Папка 3.</b> Записи Роде, январь 1945: "
+        "«Попытка вывоза через Южный вокзал. Сообщение прервано. Ящики возвращены».\n\n"
         "📚 <i>Ящики были здесь. Вывезти не смогли. Куда делись между январём и апрелем?</i>"
     )
-    kb = [[InlineKeyboardButton("Изучить личную запись →", callback_data="scene_b2")]]
+    kb = [[InlineKeyboardButton("Личная запись →", callback_data="scene_b2")]]
     await send(cq, context, text, kb, IMAGES["koenigsberg"])
 
 
 async def scene_b2(cq, context):
-    uid = cq.from_user.id
-    state = get_state(uid)
-    state["scene"] = "b2"
-
     text = (
         "🖊 <b>Личная запись (найдена среди бумаг)</b>\n\n"
         "<i>«30 марта. Г. был здесь лично. Осмотрел всё, убедился, что ящики на месте. "
         "Не двигать до особого распоряжения».</i>\n\n"
-        "Инициал «Г.» — предположительно гауляйтер <b>Эрих Кох</b>.\n\n"
+        "Инициал «Г.» — предположительно гауляйтер <b>Эрих Кох.</b>\n\n"
         "<b>Как оценить этот документ?</b>"
     )
     kb = [
-        [InlineKeyboardButton("📌 «30 марта ящики в замке — ищем что случилось за 10 дней до капитуляции»", callback_data="b2_A")],
-        [InlineKeyboardButton("❓ ««Г.» — не обязательно Кох. Документ ненадёжен»", callback_data="b2_B")],
+        [InlineKeyboardButton("📌 30 марта ящики здесь — что случилось за 10 дней?", callback_data="b2_good")],
+        [InlineKeyboardButton("❓ «Г.» — не обязательно Кох, ненадёжно", callback_data="b2_bad")],
     ]
     await send(cq, context, text, kb)
 
 
-async def handle_b2(cq, context, data):
+async def handle_b2(cq, context, ans: str):
     uid = cq.from_user.id
     state = get_state(uid)
-    correct = data == "b2_A"
+    if "b2" in state["answered"]:
+        await cq.answer("Вы уже сделали этот выбор.", show_alert=False)
+        return
+    state["answered"].add("b2")
 
-    if correct:
-        state["score"] += 5
+    if ans == "good":
         text = (
             "📌 <b>Верное направление!</b>\n\n"
             "Показание Фейерабенда независимо подтверждает этот документ: "
             "30 марта Кох лично видел ящики.\n\n"
-            "<b>Исчезновение произошло между 30 марта и 10 апреля 1945 года.</b>\n\n"
-            f"✅ <b>+5 очков!</b> Счёт: {state['score']}"
+            "<b>Исчезновение — между 30 марта и 10 апреля 1945 года.</b>"
         )
-        kb = [[InlineKeyboardButton("Квиз: персонажи →", callback_data="scene_quiz3_intro")]]
+        kb = [[InlineKeyboardButton("Квиз: персонажи →", callback_data="quiz3_intro")]]
     else:
-        text = (
-            "❓ Скептицизм полезен — но отбросить косвенную улику без замены означает остаться ни с чем.\n\n"
-            "Продолжаем поиск."
-        )
+        text = "❓ Скептицизм полезен, но без замены улики — тупик. Продолжаем поиск."
         kb = [[InlineKeyboardButton("Допросить Фейерабенда →", callback_data="scene_b3")]]
     await send(cq, context, text, kb)
 
 
-# ══════════════════════════════════════════
-# КВИЗ К3: ПЕРСОНАЖИ
-# ══════════════════════════════════════════
-
-QUIZ3 = [
-    {
-        "q": "❓ <b>Вопрос 1 из 3</b>\n\nЧто сделал Роде, когда советские войска окружали Кёнигсберг?",
-        "options": [
-            ("А) Бежал на Запад с частью ящиков", False),
-            ("Б) Передал ключи советскому командованию", False),
-            ("В) Отказался покидать город и оставался до конца", True),
-            ("Г) Уничтожил документы и скрылся", False),
-        ],
-        "explanation": "✅ Роде отказался эвакуироваться. Историки считают это косвенным свидетельством: он не хотел уходить без комнаты — значит, знал, что она где-то рядом.",
-        "wrong": "❌ Нет. Роде <b>остался в Кёнигсберге до конца</b>, отказавшись от эвакуации.",
-    },
-    {
-        "q": "❓ <b>Вопрос 2 из 3</b>\n\nКто такой Пауль Фейерабенд?",
-        "options": [
-            ("А) Офицер СС, командовавший охраной замка", False),
-            ("Б) Управляющий рестораном «Блютгерихт» при замке", True),
-            ("В) Советский переводчик на допросах Роде", False),
-            ("Г) Берлинский чиновник по эвакуации ценностей", False),
-        ],
-        "explanation": "✅ Фейерабенд — управляющий рестораном «Блютгерихт» в Кёнигсбергском замке. Он был свидетелем визита Коха 30 марта и, по версии Мосякина, именно он передал ящики советскому офицеру.",
-        "wrong": "❌ Нет. Фейерабенд — <b>управляющий рестораном «Блютгерихт»</b> при замке.",
-    },
-    {
-        "q": "❓ <b>Вопрос 3 из 3</b>\n\nЧто произошло с немецким исследователем Георгом Штайном в 1987 году?",
-        "options": [
-            ("А) Объявил, что нашёл комнату в шахте «Граслебен»", False),
-            ("Б) Опубликовал секретные архивы Штази", False),
-            ("В) Был найден мёртвым при невыясненных обстоятельствах", True),
-            ("Г) Передал материалы советскому правительству", False),
-        ],
-        "explanation": "✅ Георг Штайн посвятил десятилетия поискам. По всей видимости, вышел на след реальных документов. В 1987 году найден мёртвым при невыясненных обстоятельствах.",
-        "wrong": "❌ Нет. В 1987 году Штайн был найден <b>мёртвым при невыясненных обстоятельствах</b>.",
-    },
-]
-
 async def scene_quiz3_intro(cq, context):
-    uid = cq.from_user.id
-    state = get_state(uid)
-    state["quiz"] = {"idx": 0}
-
     text = (
         "👴 <i>Архивариус снова возникает, будто из воздуха.</i>\n\n"
         "<i>«Хорошо. Теперь проверим, разобрались ли вы, с кем имеете дело.»</i>\n\n"
@@ -633,392 +611,296 @@ async def scene_quiz3_intro(cq, context):
     await send(cq, context, text, kb)
 
 
-async def handle_quiz3(cq, context, data):
-    uid = cq.from_user.id
-    state = get_state(uid)
-
-    if data.startswith("quiz3_q"):
-        idx = int(data.split("quiz3_q")[1])
-        q = QUIZ3[idx]
-        kb = [[InlineKeyboardButton(label, callback_data=f"quiz3_a{idx}_{i}")] for i, (label, _) in enumerate(q["options"])]
-        await send(cq, context, q["q"], kb)
-
-    elif data.startswith("quiz3_a"):
-        parts = data.split("_")
-        idx = int(parts[1][1:])
-        ans = int(parts[2])
-        q = QUIZ3[idx]
-        correct = q["options"][ans][1]
-
-        if correct:
-            state["score"] += 10
-            text = q["explanation"] + f"\n\n🏅 <b>+10 очков!</b> Счёт: {state['score']}"
-        else:
-            text = q["wrong"] + f"\n\nСчёт: {state['score']}"
-
-        next_idx = idx + 1
-        if next_idx < len(QUIZ3):
-            kb = [[InlineKeyboardButton("Следующий вопрос →", callback_data=f"quiz3_q{next_idx}")]]
-        else:
-            kb = [[InlineKeyboardButton("Допросить Фейерабенда →", callback_data="scene_b3")]]
-        await send(cq, context, text, kb)
-
-
 async def scene_b3(cq, context):
-    uid = cq.from_user.id
-    state = get_state(uid)
-    state["scene"] = "b3"
-
     text = (
         "🎩 <b>Пауль Фейерабенд</b>\n\n"
         "Немолодой, аккуратный человек. Держит в руках шляпу. Совершенно спокойный.\n\n"
         "<i>«Я расскажу всё, что видел. Мне нечего скрывать.»</i>\n\n"
-        "Тридцатого марта Кох приехал в замок. Лично спустился в подвалы, осмотрел ящики, "
-        "убедился, что всё на месте, и дал указание — не трогать.\n\n"
+        "Тридцатого марта Кох приехал в замок. Лично спустился в подвалы, осмотрел ящики "
+        "и дал указание — не трогать.\n\n"
         "Потом — 9 апреля. Капитуляция.\n\n"
         "<i>«В ту ночь ко мне подошёл советский офицер и через переводчика спросил: "
-        "где ящики. Я показал. Он осмотрел. Дал расписку. Ящики увезли.»</i>\n"
+        "где ящики. Я показал. Он осмотрел. Дал расписку. Ящики увезли».»</i>\n"
         "— Пауль Фейерабенд\n\n"
         "<i>«Расписка сохранилась?»</i>\n"
-        "<i>«Нет. Я отдал её... тому офицеру.»</i>\n\n"
-        "📚 <i>По версии историка Мосякина, основанной на архивах КГБ: в ночь с 9 на 10 апреля 1945 года "
-        "Фейерабенд передал ящики советскому полковнику. Пожар начался уже ПОСЛЕ.</i>"
+        "<i>«Нет. Я отдал её тому офицеру».»</i>\n\n"
+        "📚 <i>По версии историка Мосякина: в ночь с 9 на 10 апреля Фейерабенд передал ящики "
+        "советскому полковнику. Пожар начался уже ПОСЛЕ.</i>"
     )
     kb = [[InlineKeyboardButton("К главной развилке →", callback_data="scene_r2")]]
     await send(cq, context, text, kb)
 
 
-# ══════════════════════════════════════════
-# ГЛАВНАЯ РАЗВИЛКА Р2
-# ══════════════════════════════════════════
+# ── ГЛАВНАЯ РАЗВИЛКА Р2 ──────────────────
 
 async def scene_r2(cq, context):
     uid = cq.from_user.id
-    state = get_state(uid)
-    state["scene"] = "r2"
+    get_state(uid)["scene"] = "r2"
 
     text = (
         "🗂 <b>Доклад майору Волкову</b>\n\n"
-        "На столе — всё, что удалось собрать. Хронология:\n\n"
-        "• <b>2 сент. 1944</b> — письмо Роде: комната цела в подвалах замка\n"
-        "• <b>Янв. 1945</b> — попытка вывоза через вокзал провалилась\n"
+        "Хронология:\n\n"
+        "• <b>2 сент. 1944</b> — письмо Роде: комната цела в подвалах\n"
+        "• <b>Янв. 1945</b> — попытка вывоза через вокзал — провал\n"
         "• <b>30 марта 1945</b> — Кох лично видел ящики\n"
         "• <b>9 апр. 1945</b> — капитуляция гарнизона\n"
-        "• <b>10 апр. 1945</b> — пожар в замке (уже после капитуляции)\n\n"
-        "Версия Роде о гибели в огне <b>документально опровергнута</b>.\n\n"
-        "<i>«Итак? Что думаешь?»</i> — Майор Волков\n\n"
+        "• <b>10 апр. 1945</b> — пожар (уже после капитуляции!)\n\n"
+        "Версия Роде о гибели в огне <b>документально опровергнута.</b>\n\n"
+        "<i>«Итак? Что думаешь?»</i>\n\n"
+        "— Майор Волков\n\n"
         "<b>Выдвини свою версию:</b>"
     )
     kb = [
-        [InlineKeyboardButton("🏰 А: Спрятана в подземных бункерах Кёнигсберга", callback_data="ending_A")],
-        [InlineKeyboardButton("⛏ Б: Вывезена в соляные шахты Тюрингии", callback_data="ending_B")],
-        [InlineKeyboardButton("🌊 В: Погружена на корабль — затонула в Балтике", callback_data="ending_C")],
-        [InlineKeyboardButton("🤝 Г: Советские войска передали США (версия Мосякина)", callback_data="ending_D")],
-        [InlineKeyboardButton("🔥 Д: Уничтожена в пожаре (версия Роде)", callback_data="ending_E")],
+        [InlineKeyboardButton("🏰 Бункеры Кёнигсберга", callback_data="ending_A")],
+        [InlineKeyboardButton("⛏ Шахты Тюрингии", callback_data="ending_B")],
+        [InlineKeyboardButton("🌊 Пароход в Балтике", callback_data="ending_C")],
+        [InlineKeyboardButton("🤝 СССР передал США (версия Мосякина)", callback_data="ending_D")],
+        [InlineKeyboardButton("🔥 Сгорела — версия Роде", callback_data="ending_E")],
     ]
     await send(cq, context, text, kb, IMAGES["amber_panel"])
 
 
-# ══════════════════════════════════════════
-# КОНЦОВКИ
-# ══════════════════════════════════════════
+# ── КОНЦОВКИ ─────────────────────────────
 
 ENDINGS = {
     "A": {
         "title": "🏰 КЁНИГСБЕРГ — ПОДЗЕМНЫЕ БУНКЕРЫ",
-        "credibility": "📊 Достоверность: <b>ВЫСОКАЯ</b>",
-        "text": (
+        "cred":  "📊 Достоверность: <b>ВЫСОКАЯ</b>",
+        "body": (
             "Ты докладываешь: комната — в Кёнигсберге.\n\n"
-            "Основания железные: Роде отказался уезжать из города и жил рядом с ящиками — "
-            "если бы их вывезли, зачем оставаться? Кох лично видел ящики 30 марта. "
-            "Попытка вывоза в январе провалилась. Нет документальных следов перемещения.\n\n"
-            "Подвалы замка — трёхъярусные каменные погреба ресторана «Блютгерихт» — "
-            "никогда не были полностью обследованы. Бункеры Коха: часть тоннелей по сей день недоступна.\n\n"
-            "В 2025 году рассекреченные архивы ФСБ усложняют картину: весной 1945 года "
-            "из Кёнигсберга отправился эшелон с «музейными ценностями» с маршрутом на три точки "
-            "в Тюрингии. Часть содержимого уехала? Или другой груз? Вопрос открыт.\n\n"
-            "<i>«Значит, ищем здесь. В руинах нынешнего Калининграда. "
-            "Если версия верна — комната ждёт под нашими ногами уже восемьдесят лет.»</i>\n"
-            "— Майор Волков\n\n"
-            "📚 <i>Подземные сооружения Кёнигсберга до сих пор не обследованы полностью. "
-            "Ряд тоннелей остаётся недоступным. (Архивы ФСБ, 2025)</i>"
+            "Основания железные: Роде отказался уезжать — если бы ящики вывезли, зачем оставаться? "
+            "Кох лично видел их 30 марта. Попытка вывоза в январе провалилась. "
+            "Нет ни одного документального следа перемещения.\n\n"
+            "Подвалы замка и бункеры Коха по сей день не обследованы полностью. "
+            "В 2025 году рассекреченные архивы ФСБ добавляют сложность: весной 1945-го "
+            "из Кёнигсберга ушёл эшелон с «музейными ценностями» с маршрутом на Тюрингию. "
+            "Другой груз? Часть содержимого? Вопрос открыт.\n\n"
+            "<i>«Значит, ищем здесь. Если версия верна — комната ждёт под нашими ногами уже восемьдесят лет».»</i>\n"
+            "— Майор Волков"
         ),
     },
     "B": {
         "title": "⛏ ТЮРИНГИЯ — СОЛЯНЫЕ ШАХТЫ",
-        "credibility": "📊 Достоверность: <b>СРЕДНЯЯ</b>",
-        "text": (
+        "cred":  "📊 Достоверность: <b>СРЕДНЯЯ</b>",
+        "body": (
             "Ты выдвигаешь тюрингскую версию.\n\n"
-            "Немецкий исследователь Георг Штайн установил: часть деталей комнаты была "
+            "Исследователь Георг Штайн установил: часть деталей комнаты хранилась "
             "в замке Рейнхардсбрунн, затем — в шахте «Граслебен-1».\n\n"
-            "Косвенные подтверждения: крейсер «Эмден», вывезший из Восточной Пруссии "
-            "ценнейшие грузы, следовал именно в Тюрингию. В 2018 году пробы воды в шахте "
-            "«Граслебен» показали повышенное содержание янтарной кислоты — "
-            "потенциальный след разложения янтаря. В 2025 году архивы ФСБ указали на "
-            "три точки в Тюрингии в маршруте «музейного эшелона».\n\n"
-            "Контраргумент серьёзный: янтарь не рассчитан на шахтные условия. "
+            "В 2018 году пробы воды в шахте показали повышенное содержание янтарной кислоты — "
+            "потенциальный след разложения янтаря. "
+            "В 2025 году архивы ФСБ указали на три точки в Тюрингии в маршруте «музейного эшелона».\n\n"
+            "Контраргумент: янтарь не рассчитан на шахтные условия. "
             "За восемьдесят лет он мог разрушиться.\n\n"
-            "<i>«Ищем в Германии. Долгий путь. Но, возможно, ведущий к физическим уликам.»</i>\n"
-            "— Майор Волков\n\n"
-            "📚 <i>В 2018 году в шахте «Граслебен» зафиксировано повышенное содержание "
-            "янтарной кислоты в пробах воды.</i>"
+            "<i>«Ищем в Германии. Долгий путь. Но, возможно, ведущий к физическим уликам».»</i>\n"
+            "— Майор Волков"
         ),
     },
     "C": {
         "title": "🌊 БАЛТИЙСКОЕ МОРЕ — ПАРОХОД «КАРЛСРУЭ»",
-        "credibility": "📊 Достоверность: <b>НИЗКАЯ</b>",
-        "text": (
-            "Ты выдвигаешь морскую версию. В апреле 1945 года пароход «Карлсруэ» затонул "
-            "в Балтийском море. В 2020 году польские водолазы обнаружили судно на дне "
-            "с загадочными запечатанными ящиками в трюме. Ящики по сей день недоступны.\n\n"
+        "cred":  "📊 Достоверность: <b>НИЗКАЯ</b>",
+        "body": (
+            "Ты выдвигаешь морскую версию. В апреле 1945 года пароход «Карлсруэ» затонул. "
+            "В 2020 году польские водолазы нашли его с запечатанными ящиками в трюме.\n\n"
             "Волков хмурится.\n\n"
-            "<i>«Версия романтичная, но посмотрите на факты. Во-первых, Кох лично запретил "
-            "морской вывоз ценностей после гибели «Густлоффа». Во-вторых, по показаниям "
-            "Фейерабенда, ящики были в замке 30 марта, а за 10 дней до капитуляции "
-            "организовать морской вывоз под огнём практически невозможно.»</i>\n"
+            "<i>«Версия романтичная, но: Кох лично запретил морской вывоз после гибели «Густлоффа». "
+            "По показаниям Фейерабенда, ящики были в замке 30 марта — "
+            "за 10 дней до капитуляции, под огнём, морской вывоз практически невозможен».»</i>\n"
             "— Майор Волков\n\n"
-            "Версия не исключена — но документально слабо обоснована. "
-            "Связь «Карлсруэ» с янтарной комнатой не доказана.\n\n"
-            "📚 <i>Пароход «Карлсруэ» обнаружен польскими водолазами в 2020 году. "
-            "Запечатанные ящики в трюме до сих пор не подняты. (РИА Новости, 2025)</i>"
+            "Версия не исключена — но документально слабо обоснована.\n\n"
+            "📚 <i>Пароход «Карлсруэ» обнаружен в 2020 году. Ящики до сих пор не подняты.</i>"
         ),
     },
     "D": {
         "title": "🤝 СССР → США — ВЕРСИЯ МОСЯКИНА",
-        "credibility": "📊 Достоверность: <b>ДОКУМЕНТАЛЬНО ОБОСНОВАНА, СПОРНА</b>",
-        "text": (
+        "cred":  "📊 Достоверность: <b>ДОКУМЕНТАЛЬНО ОБОСНОВАНА, СПОРНА</b>",
+        "body": (
             "Ты выдвигаешь версию, которая меняет всё.\n\n"
-            "Если Фейерабенд говорит правду — ящики передал советский офицер. А дальше? "
-            "Историк Мосякин на основе архивов КГБ и личного архива Кучумова утверждает: "
-            "ящики вывезены в Восточный Берлин, а в 1950 году <b>тайно переданы американским "
-            "оккупационным властям в счёт погашения советских долгов по ленд-лизу.</b>\n\n"
+            "Историк Мосякин на основе архивов КГБ утверждает: ящики вывезены в Восточный Берлин, "
+            "а в 1950 году <b>тайно переданы американским оккупационным властям "
+            "в счёт погашения советских долгов по ленд-лизу.</b>\n\n"
             "Именно поэтому советское правительство хранило молчание. "
-            "Именно поэтому Кучумов дал подписку МГБ о неразглашении и унёс тайну в могилу. "
-            "Признать, что «восьмое чудо света» отдано американцам в уплату долга — "
-            "значит признать провал.\n\n"
-            "Доклад Мосякина представлен на Царскосельской научной конференции 2019 года. "
-            "Принят без возражений. Опубликован на официальном сайте ГМЗ «Царское Село».\n\n"
-            "<i>«Если это правда… — Волков замолкает. — "
-            "Тогда это не наше расследование. Тогда это государственная тайна. "
-            "С обеих сторон.»</i>\n"
-            "— Майор Волков\n\n"
-            "📚 <i>Версия Мосякина основана на архивах КГБ СССР. "
-            "Доклад опубликован на tzar.ru (ГМЗ «Царское Село», 2019)</i>"
+            "Именно поэтому Кучумов дал подписку МГБ о неразглашении и унёс тайну в могилу.\n\n"
+            "Доклад Мосякина представлен на конференции 2019 года. "
+            "Принят без возражений. Опубликован на сайте ГМЗ «Царское Село».\n\n"
+            "<i>«Если это правда… Тогда это не наше расследование. "
+            "Тогда это государственная тайна. С обеих сторон».»</i>\n"
+            "— Майор Волков"
         ),
     },
     "E": {
         "title": "🔥 УНИЧТОЖЕНА В ПОЖАРЕ — ВЕРСИЯ РОДЕ",
-        "credibility": "📊 Достоверность: <b>ОПРОВЕРГНУТА</b>",
-        "text": (
+        "cred":  "📊 Достоверность: <b>ОПРОВЕРГНУТА</b>",
+        "body": (
             "Ты поддерживаешь версию Роде: комната сгорела.\n\n"
-            "Волков долго смотрит на тебя, затем открывает папку.\n\n"
-            "<i>«Давайте по фактам. Пожар в замке начался в ночь с 9 на 10 апреля — "
-            "уже ПОСЛЕ капитуляции гарнизона. По показаниям Фейерабенда, к тому моменту "
-            "ящики уже были переданы советскому офицеру. Профессор Брюсов — "
-            "первая советская поисковая экспедиция — зафиксировал это в дневнике. "
-            "Пожар физически не мог уничтожить то, чего уже не было в замке.»</i>\n"
+            "Волков открывает папку.\n\n"
+            "<i>«По фактам. Пожар начался уже ПОСЛЕ капитуляции. "
+            "По показаниям Фейерабенда, ящики к тому моменту уже передали советскому офицеру. "
+            "Профессор Брюсов зафиксировал это в дневнике. "
+            "Пожар не мог уничтожить то, чего не было в замке».»</i>\n"
             "— Майор Волков\n\n"
-            "Роде продвигал эту версию намеренно — чтобы закрыть дело. "
-            "Если комната «сгорела», искать нечего.\n\n"
-            "Отсеивание ложных версий — тоже часть детективной работы. Ты исключил тупик.\n\n"
-            "<i>«Попробуй снова. Теперь, когда знаешь, что не работает — ты ближе к ответу.»</i>\n"
-            "— Майор Волков\n\n"
-            "📚 <i>«Кёнигсбергский дневник» профессора Брюсова был засекречен и рассекречен "
-            "лишь в постсоветское время.</i>"
+            "Роде продвигал эту версию намеренно: если комната «сгорела» — искать нечего.\n\n"
+            "<i>«Попробуй снова. Теперь ты ближе к ответу».»</i>\n"
+            "— Майор Волков"
         ),
     },
 }
 
-async def scene_ending(cq, context, ending_key):
+
+async def scene_ending(cq, context, key: str):
     uid = cq.from_user.id
-    state = get_state(uid)
-    state["scene"] = f"ending_{ending_key}"
-    ending = ENDINGS[ending_key]
-
-    text = (
-        f"⭐ <b>{ending['title']}</b>\n"
-        f"{ending['credibility']}\n\n"
-        f"{ending['text']}"
-    )
-    kb = [[InlineKeyboardButton("Финальный квиз →", callback_data="scene_quiz4_intro")]]
-
-    photo = IMAGES["restored"] if ending_key in ("A", "D") else None
+    get_state(uid)["scene"] = f"ending_{key}"
+    e = ENDINGS[key]
+    text = f"⭐ <b>{e['title']}</b>\n{e['cred']}\n\n{e['body']}"
+    kb = [[InlineKeyboardButton("Финальный квиз →", callback_data="quiz4_intro")]]
+    photo = IMAGES["restored"] if key in ("A", "D") else None
     await send(cq, context, text, kb, photo)
 
 
-# ══════════════════════════════════════════
-# КВИЗ К4: ФИНАЛЬНЫЙ
-# ══════════════════════════════════════════
-
-QUIZ4 = [
-    {
-        "q": "❓ <b>Финал, вопрос 1 из 3</b>\n\nКогда открылась воссозданная Янтарная комната в Царском Селе?",
-        "options": [
-            ("А) 14 сентября 1995 года", False),
-            ("Б) 31 мая 2003 года", True),
-            ("В) 9 мая 2005 года", False),
-            ("Г) 12 июня 2000 года", False),
-        ],
-        "explanation": "✅ <b>31 мая 2003 года.</b> Работа началась в 1983-м и заняла 20 лет. Сорок мастеров восстанавливали шедевр по немногочисленным довоенным фотографиям.",
-        "wrong": "❌ Нет. Воссозданная комната открылась <b>31 мая 2003 года</b> после 20 лет работы.",
-    },
-    {
-        "q": "❓ <b>Финал, вопрос 2 из 3</b>\n\nЧто подтвердили рассекреченные архивы ФСБ в 2025 году?",
-        "options": [
-            ("А) Роде лично уничтожил часть панелей", False),
-            ("Б) Комната передана США в 1950 году", False),
-            ("В) Из Кёнигсберга отправился эшелон с «музейными ценностями» — маршрут на три точки в Тюрингии", True),
-            ("Г) Ящики утоплены в Балтийском море по приказу Коха", False),
-        ],
-        "explanation": "✅ Рассекреченные архивы ФСБ (2025) подтвердили: весной 1945-го из Кёнигсберга отправился эшелон с маршрутными точками в Тюрингии — первое официально российское свидетельство о возможном маршруте вывоза.",
-        "wrong": "❌ Нет. Архивы ФСБ 2025 года подтвердили существование <b>«музейного эшелона»</b> с маршрутом на Тюрингию.",
-    },
-    {
-        "q": "❓ <b>Финал, вопрос 3 из 3</b>\n\nЧто обнаружили польские водолазы в 2020 году?",
-        "options": [
-            ("А) Фрагменты янтарных панелей на морском дне", False),
-            ("Б) Пароход «Карлсруэ» с запечатанными ящиками в трюме", True),
-            ("В) Подводную базу для хранения немецких ценностей", False),
-            ("Г) Документы с координатами тайника в Тюрингии", False),
-        ],
-        "explanation": "✅ Польские водолазы обнаружили пароход «Карлсруэ» с запечатанными ящиками. Связь с Янтарной комнатой не доказана — но и не исключена.",
-        "wrong": "❌ Нет. Обнаружен <b>пароход «Карлсруэ»</b> с запечатанными ящиками в трюме.",
-    },
-]
-
 async def scene_quiz4_intro(cq, context):
-    uid = cq.from_user.id
-    state = get_state(uid)
-    state["quiz"] = {"idx": 0}
-
     text = (
         "👴 <i>Архивариус ждёт у выхода.</i>\n\n"
         "<i>«Три последних вопроса. О том, что произошло после.»</i>\n\n"
-        "<b>+10 очков</b> за каждый правильный ответ\n\n"
-        "<b>Финальный квиз!</b>"
+        "<b>+10 очков</b> за каждый правильный ответ"
     )
     kb = [[InlineKeyboardButton("Начать →", callback_data="quiz4_q0")]]
     await send(cq, context, text, kb)
 
 
-async def handle_quiz4(cq, context, data):
-    uid = cq.from_user.id
-    state = get_state(uid)
-
-    if data.startswith("quiz4_q"):
-        idx = int(data.split("quiz4_q")[1])
-        q = QUIZ4[idx]
-        kb = [[InlineKeyboardButton(label, callback_data=f"quiz4_a{idx}_{i}")] for i, (label, _) in enumerate(q["options"])]
-        await send(cq, context, q["q"], kb)
-
-    elif data.startswith("quiz4_a"):
-        parts = data.split("_")
-        idx = int(parts[1][1:])
-        ans = int(parts[2])
-        q = QUIZ4[idx]
-        correct = q["options"][ans][1]
-
-        if correct:
-            state["score"] += 10
-            text = q["explanation"] + f"\n\n🏅 <b>+10 очков!</b> Счёт: {state['score']}"
-        else:
-            text = q["wrong"] + f"\n\nСчёт: {state['score']}"
-
-        next_idx = idx + 1
-        if next_idx < len(QUIZ4):
-            kb = [[InlineKeyboardButton("Следующий вопрос →", callback_data=f"quiz4_q{next_idx}")]]
-        else:
-            kb = [[InlineKeyboardButton("Итоговый экран →", callback_data="scene_final")]]
-        await send(cq, context, text, kb)
-
-
-# ══════════════════════════════════════════
-# ИТОГОВЫЙ ЭКРАН
-# ══════════════════════════════════════════
+# ── ИТОГОВЫЙ ЭКРАН ────────────────────────
 
 async def scene_final(cq, context):
     uid = cq.from_user.id
-    state = get_state(uid)
-    score = state["score"]
+    score = get_state(uid)["score"]
 
-    if score <= 20:
-        rank = "🔍 Начинающий следователь"
-        comment = "Тайна пока что сильнее вас"
-    elif score <= 40:
-        rank = "🕵️ Опытный детектив"
-        comment = "Хороший нюх, но детали ускользают"
+    if score <= 30:
+        rank, comment = "🔍 Начинающий следователь", "Тайна пока что сильнее вас"
+    elif score <= 60:
+        rank, comment = "🕵️ Опытный детектив", "Хороший нюх, но детали ускользают"
     else:
-        rank = "⭐ Мастер расследования"
-        comment = "Вы видите то, что другие пропускают"
+        rank, comment = "⭐ Мастер расследования", "Вы видите то, что другие пропускают"
 
     text = (
         "🏆 <b>РАССЛЕДОВАНИЕ ЗАВЕРШЕНО</b>\n\n"
-        f"Ваш счёт: <b>{score} / 55 очков</b>\n"
+        f"Ваш счёт: <b>{score} / 90 очков</b>\n"
         f"Звание: {rank}\n"
         f"<i>{comment}</i>\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📰 <b>Состояние поисков сегодня:</b>\n\n"
-        "Воссозданная Янтарная комната открылась в Екатерининском дворце "
-        "<b>31 мая 2003 года</b> после двадцати лет работы. Но оригинал по-прежнему не найден.\n\n"
-        "• 🌊 <b>2020</b> — польские водолазы обнаружили пароход «Карлсруэ» с "
-        "запечатанными ящиками на дне Балтики\n"
-        "• 📂 <b>2025</b> — архивы ФСБ рассекретили документы о «музейном эшелоне» "
-        "с маршрутом на Тюрингию — первое официальное российское свидетельство\n\n"
-        "Тайна по-прежнему не разгадана. Ни одна из версий не получила "
-        "окончательного физического подтверждения. Комната молчит — как молчала восемьдесят лет."
+        "📰 <b>Поиски сегодня:</b>\n\n"
+        "Воссозданная комната открылась в Екатерининском дворце <b>31 мая 2003 года</b> "
+        "после двадцати лет работы сорока мастеров. Оригинал по-прежнему не найден.\n\n"
+        "• 🌊 <b>2020</b> — польские водолазы нашли пароход «Карлсруэ» с запечатанными ящиками\n"
+        "• 📂 <b>2025</b> — ФСБ рассекретила документы о «музейном эшелоне» с маршрутом на Тюрингию\n\n"
+        "Тайна не разгадана. Ни одна версия не получила окончательного подтверждения. "
+        "Комната молчит — как молчала восемьдесят лет."
     )
-    kb = [[InlineKeyboardButton("🔄 Пройти снова по другому пути", callback_data="scene_prologue")]]
+    kb = [
+        [InlineKeyboardButton("📚 Что почитать и посмотреть", callback_data="scene_sources")],
+        [InlineKeyboardButton("🔄 Пройти снова", callback_data="scene_prologue")],
+    ]
     await send(cq, context, text, kb, IMAGES["restored"])
 
 
+# ── ИСТОЧНИКИ ─────────────────────────────
+
+async def scene_sources(cq, context):
+    text = (
+        "📚 <b>ЧТО ПОЧИТАТЬ И ПОСМОТРЕТЬ</b>\n\n"
+
+        "─── 🎬 Видео ───\n\n"
+
+        "1. <b>«Янтарная комната. Самое важное»</b> (3 части, ~30 мин каждая)\n"
+        "Видеоцикл музея-заповедника «Царское Село». История, поиски, воссоздание. "
+        "Интервью с директором, хранителями и руководителем янтарной мастерской.\n"
+        "▶ rutube.ru/video/9ab911e799fb5568bcf0e88b3d92cf1a\n\n"
+
+        "2. <b>Виртуальный тур «Царское Село»</b>\n"
+        "Экскурсия по Екатерининскому дворцу и Янтарной комнате. "
+        "История создания, техника янтарных панно, обход всех стен интерьера.\n"
+        "▶ tzar.ru/virtual_tour\n\n"
+
+        "3. <b>Интервью с Борисом Игдаловым</b> (канал «Санкт-Петербург», 56 мин)\n"
+        "Реставратор высшей категории, руководитель Царскосельской янтарной мастерской. "
+        "О воссоздании, технологии флорентийских мозаик и мифах об оригинале.\n"
+        "▶ youtu.be/-C7y8usBZ_Y\n\n"
+
+        "─── 📖 Книги ───\n\n"
+
+        "4. <b>Воронов М.Г., Кучумов А.М.</b> «Янтарная комната»\n"
+        "Л.: Художник РСФСР, 1989 — фундаментальное исследование от главного хранителя.\n\n"
+
+        "5. <b>Мосякин А.Г.</b> «Прусское проклятие. Тайна Янтарной комнаты»\n"
+        "СПб., 2018, 2020 — версия о передаче США, основана на архивах КГБ.\n\n"
+
+        "6. <b>Овсянов А.П.</b> «Янтарная комната: Возрождение шедевра»\n"
+        "Калининград: Янтарный сказ, 2002 — история воссоздания.\n\n"
+
+        "─── 🌐 Онлайн ───\n\n"
+
+        "7. <b>ГМЗ «Царское Село»</b> — научные статьи и доклад Мосякина 2019 года.\n"
+        "▶ tzar.ru"
+    )
+    kb = [[InlineKeyboardButton("🔄 Пройти снова", callback_data="scene_prologue")]]
+    await send(cq, context, text, kb)
+
+
 # ══════════════════════════════════════════
-# МАРШРУТИЗАТОР CALLBACK
+# МАРШРУТИЗАТОР
 # ══════════════════════════════════════════
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cq = update.callback_query
     await cq.answer()
-    data = cq.data
+    d = cq.data
 
     routes = {
-        "scene_prologue":      scene_prologue,
-        "scene_quiz1_intro":   scene_quiz1_intro,
-        "scene_r1":            scene_r1,
-        "scene_a1":            scene_a1,
-        "scene_a2_choice1":    scene_a2_choice1,
-        "scene_a2_choice2":    scene_a2_choice2,
-        "scene_quiz2_intro":   scene_quiz2_intro,
-        "scene_a3":            scene_a3,
-        "scene_b1":            scene_b1,
-        "scene_b2":            scene_b2,
-        "scene_b3":            scene_b3,
-        "scene_quiz3_intro":   scene_quiz3_intro,
-        "scene_r2":            scene_r2,
-        "scene_quiz4_intro":   scene_quiz4_intro,
-        "scene_final":         scene_final,
+        "scene_prologue":    scene_prologue,
+        "scene_r1":          scene_r1,
+        "scene_a1":          scene_a1,
+        "scene_a2_c1":       scene_a2_c1,
+        "scene_a2_c2":       scene_a2_c2,
+        "scene_a3":          scene_a3,
+        "scene_b1":          scene_b1,
+        "scene_b2":          scene_b2,
+        "scene_b3":          scene_b3,
+        "scene_r2":          scene_r2,
+        "scene_final":       scene_final,
+        "scene_sources":     scene_sources,
+        "quiz1_intro":       scene_quiz1_intro,
+        "quiz2_intro":       scene_quiz2_intro,
+        "quiz3_intro":       scene_quiz3_intro,
+        "quiz4_intro":       scene_quiz4_intro,
     }
 
-    if data in routes:
-        await routes[data](cq, context)
-    elif data.startswith("quiz1_"):
-        await handle_quiz1(cq, context, data)
-    elif data.startswith("quiz2_"):
-        await handle_quiz2(cq, context, data)
-    elif data.startswith("quiz3_"):
-        await handle_quiz3(cq, context, data)
-    elif data.startswith("quiz4_"):
-        await handle_quiz4(cq, context, data)
-    elif data.startswith("a2_c1_"):
-        await handle_a2_c1(cq, context, data)
-    elif data.startswith("a2_c2_"):
-        await handle_a2_c2(cq, context, data)
-    elif data.startswith("a3_"):
-        await handle_a3(cq, context, data)
-    elif data.startswith("b2_"):
-        await handle_b2(cq, context, data)
-    elif data.startswith("ending_"):
-        key = data.split("ending_")[1]
-        await scene_ending(cq, context, key)
+    if d in routes:
+        await routes[d](cq, context)
+        return
+
+    for prefix, quiz_list, next_cb in [
+        ("quiz1", QUIZ1, "scene_r1"),
+        ("quiz2", QUIZ2, "scene_a3"),
+        ("quiz3", QUIZ3, "scene_b3"),
+        ("quiz4", QUIZ4, "scene_final"),
+    ]:
+        if d.startswith(f"{prefix}_q") or d.startswith(f"{prefix}_a"):
+            await run_quiz(cq, context, d, quiz_list, prefix, next_cb)
+            return
+
+    if d.startswith("ending_"):
+        await scene_ending(cq, context, d.split("ending_")[1])
+        return
+
+    if d.startswith("a2c1_"):
+        await handle_a2c1(cq, context, d.split("a2c1_")[1])
+        return
+    if d.startswith("a2c2_"):
+        await handle_a2c2(cq, context, d.split("a2c2_")[1])
+        return
+    if d.startswith("a3_"):
+        await handle_a3(cq, context, d.split("a3_")[1])
+        return
+    if d.startswith("b2_"):
+        await handle_b2(cq, context, d.split("b2_")[1])
+        return
 
 
 # ══════════════════════════════════════════
@@ -1030,28 +912,27 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    state = get_state(uid)
-    await update.message.reply_text(f"🏅 Текущий счёт: <b>{state['score']} / 55</b>", parse_mode="HTML")
+    score = get_state(uid)["score"]
+    await update.message.reply_text(
+        f"🏅 Текущий счёт: <b>{score} / 90</b>", parse_mode="HTML"
+    )
 
 async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     reset_state(uid)
-    await update.message.reply_text("🔄 Расследование начато заново.")
     await scene_start(update, context)
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
+    await update.message.reply_text(
         "📖 <b>ТАЙНА ЯНТАРНОЙ КОМНАТЫ</b>\n\n"
-        "Команды:\n"
         "/start — начать игру\n"
         "/score — текущий счёт\n"
         "/restart — начать заново\n"
         "/help — эта справка\n\n"
-        "Максимальный счёт: <b>55 очков</b>\n"
-        "• 30 очков — за квизы (3 × 3 × 10)\n"
-        "• 25 очков — за верные сюжетные выборы"
+        "Максимальный счёт: <b>90 очков</b> (9 вопросов × 10)\n"
+        "Повторные нажатия очков не дают.",
+        parse_mode="HTML"
     )
-    await update.message.reply_text(text, parse_mode="HTML")
 
 
 # ══════════════════════════════════════════
@@ -1073,6 +954,7 @@ def main():
 
     logger.info("Бот запущен...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
