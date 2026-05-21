@@ -25,13 +25,31 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════
 # ИЗОБРАЖЕНИЯ
 # ══════════════════════════════════════════
+# ══════════════════════════════════════════
+# ИЗОБРАЖЕНИЯ
+# После запуска upload_photos.py замените None на полученные file_id
+# ══════════════════════════════════════════
 IMAGES = {
-    "amber_room":   "https://upload.wikimedia.org/wikipedia/commons/6/60/Amber_Room_Tsarskoye_Selo_2.jpg",
-    "koenigsberg":  "https://upload.wikimedia.org/wikipedia/commons/thumb/8/80/Bundesarchiv_Bild_101I-209-0091-24%2C_K%C3%B6nigsberg%2C_Schlossteich.jpg/1280px-Bundesarchiv_Bild_101I-209-0091-24%2C_K%C3%B6nigsberg%2C_Schlossteich.jpg",
-    "castle_ruins": "https://upload.wikimedia.org/wikipedia/commons/thumb/f/f5/RIAN_archive_44732_Soviet_troops_storm_Koenigsberg.jpg/1024px-RIAN_archive_44732_Soviet_troops_storm_Koenigsberg.jpg",
-    "amber_panel":  "https://upload.wikimedia.org/wikipedia/commons/6/60/Amber_Room_Tsarskoye_Selo_2.jpg",
-    "detective":    "https://upload.wikimedia.org/wikipedia/commons/thumb/f/f5/RIAN_archive_44732_Soviet_troops_storm_Koenigsberg.jpg/1024px-RIAN_archive_44732_Soviet_troops_storm_Koenigsberg.jpg",
-    "restored":     "https://upload.wikimedia.org/wikipedia/commons/6/60/Amber_Room_Tsarskoye_Selo_2.jpg",
+    # Основные
+    "amber_room":    None,  # Янтарная комната — стартовый экран
+    "restored":      None,  # Янтарная комната — финал (то же фото)
+    # Кёнигсберг
+    "koenigsberg":   None,  # Кёнигсберг 1945 — советские войска
+    "castle_ruins":  None,  # Архивная комната — руины замка
+    "detective":     None,  # алиас koenigsberg
+    # Персонажи
+    "rode_portrait": None,  # Досье Роде — портрет
+    "interrogation": None,  # Комната допроса
+    "feyerabend":    None,  # Пауль Фейерабенд
+    # Документы
+    "letter_rode":   None,  # Машинописное письмо
+    "archive_room":  None,  # Архивная комната замка
+    "secret_files":  None,  # Секретные папки КГБ
+    # Концовки
+    "amber_panel":   None,  # Янтарная панель — развилка Р2
+    "bunker":        None,  # Подземный бункер — концовка А
+    "salt_mine":     None,  # Соляная шахта — концовка Б
+    "ship_wreck":    None,  # Пароход на дне — концовка В
 }
 
 # ══════════════════════════════════════════
@@ -274,11 +292,20 @@ async def run_quiz(cq, context, data: str, quiz_list: list, prefix: str, next_cb
     if data.startswith(f"{prefix}_q"):
         idx = int(data[len(f"{prefix}_q"):])
         q = quiz_list[idx]
-        kb = [
-            [InlineKeyboardButton(label, callback_data=f"{prefix}_a{idx}_{i}")]
+        # Варианты в тексте, кнопки — только номера
+        nums = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]
+        opts_text = "\n".join(
+            f"{nums[i]} {label}"
             for i, (label, _) in enumerate(q["opts"])
+        )
+        full_text = q["q"] + "\n\n" + opts_text
+        kb = [
+            [InlineKeyboardButton(str(i + 1), callback_data=f"{prefix}_a{idx}_{i}")]
+            for i in range(len(q["opts"]))
         ]
-        await send(cq, context, q["q"], kb)
+        # Кнопки в один ряд
+        kb = [kb[0] + kb[1] + kb[2] + kb[3]] if len(kb) == 4 else kb
+        await send(cq, context, full_text, kb)
         return
 
     if data.startswith(f"{prefix}_a"):
@@ -400,20 +427,22 @@ async def scene_a1(cq, context):
         "📚 <i>Последнее письмо Роде датировано 2 сентября 1944 года: комната цела, полная сохранность.</i>"
     )
     kb = [[InlineKeyboardButton("На допрос →", callback_data="scene_a2_c1")]]
-    await send(cq, context, text, kb)
+    await send(cq, context, text, kb, IMAGES["rode_portrait"])
 
 
 async def scene_a2_c1(cq, context):
     text = (
         "🪑 <b>Комната для допросов</b>\n\n"
         "Роде сидит напротив. Пожилой, бледный. Руки сложены на столе — слишком спокойно.\n\n"
-        "<b>Выберите тактику:</b>"
+        "<b>Выберите тактику:</b>\n\n"
+        "1️⃣ Давить напрямую: «Пожар начался уже после капитуляции — где комната?»\n"
+        "2️⃣ Сначала разговорить: «Расскажите о комнате — вы любили её больше всех»"
     )
-    kb = [
-        [InlineKeyboardButton("⚡ Давить напрямую", callback_data="a2c1_press")],
-        [InlineKeyboardButton("💬 Сначала разговорить", callback_data="a2c1_talk")],
-    ]
-    await send(cq, context, text, kb)
+    kb = [[
+        InlineKeyboardButton("1", callback_data="a2c1_press"),
+        InlineKeyboardButton("2", callback_data="a2c1_talk"),
+    ]]
+    await send(cq, context, text, kb, IMAGES["interrogation"])
 
 
 async def handle_a2c1(cq, context, ans: str):
@@ -449,12 +478,14 @@ async def handle_a2c1(cq, context, ans: str):
 async def scene_a2_c2(cq, context):
     text = (
         "📄 <b>Письмо Роде от 2 сентября 1944 года</b>\n\n"
-        "Фотокопия у тебя в руках. Как использовать?"
+        "Фотокопия у тебя в руках. Как использовать?\n\n"
+        "1️⃣ Предъявить письмо: «Двумя неделями раньше вы писали, что комната цела. Когда сгорела?»\n"
+        "2️⃣ Назвать свидетеля: «У нас есть человек, который видел ящики 30 марта 1945 года»"
     )
-    kb = [
-        [InlineKeyboardButton("📋 Предъявить письмо напрямую", callback_data="a2c2_letter")],
-        [InlineKeyboardButton("👤 Назвать имя Фейерабенда", callback_data="a2c2_witness")],
-    ]
+    kb = [[
+        InlineKeyboardButton("1", callback_data="a2c2_letter"),
+        InlineKeyboardButton("2", callback_data="a2c2_witness"),
+    ]]
     await send(cq, context, text, kb)
 
 
@@ -508,11 +539,16 @@ async def scene_a3(cq, context):
         "Это последний задокументированный след. После — тишина.\n\n"
         "<b>Как интерпретировать?</b>"
     )
-    kb = [
-        [InlineKeyboardButton("📍 Ящики целы на сент. 44 — ищем что было дальше", callback_data="a3_good")],
-        [InlineKeyboardButton("🤔 Письмо могло быть написано для отчётности", callback_data="a3_bad")],
-    ]
-    await send(cq, context, text, kb)
+    text += (
+        "\n\n"
+        "1️⃣ На 2 сентября 1944 ящики в подвалах замка — ищем что случилось между сент. 44 и апр. 45\n"
+        "2️⃣ Письмо могло быть написано для отчётности — Роде скрывал реальное положение дел"
+    )
+    kb = [[
+        InlineKeyboardButton("1", callback_data="a3_good"),
+        InlineKeyboardButton("2", callback_data="a3_bad"),
+    ]]
+    await send(cq, context, text, kb, IMAGES["letter_rode"])
 
 
 async def handle_a3(cq, context, ans: str):
@@ -539,7 +575,7 @@ async def handle_a3(cq, context, ans: str):
             "Без документальных подтверждений версия о фальсификации повисает в воздухе."
         )
     kb = [[InlineKeyboardButton("К главной развилке →", callback_data="scene_r2")]]
-    await send(cq, context, text, kb)
+    await send(cq, context, text, kb, IMAGES["feyerabend"])
 
 
 # ── ПУТЬ Б ───────────────────────────────
@@ -561,7 +597,7 @@ async def scene_b1(cq, context):
         "📚 <i>Ящики были здесь. Вывезти не смогли. Куда делись между январём и апрелем?</i>"
     )
     kb = [[InlineKeyboardButton("Личная запись →", callback_data="scene_b2")]]
-    await send(cq, context, text, kb, IMAGES["koenigsberg"])
+    await send(cq, context, text, kb, IMAGES["archive_room"])
 
 
 async def scene_b2(cq, context):
@@ -572,10 +608,15 @@ async def scene_b2(cq, context):
         "Инициал «Г.» — предположительно гауляйтер <b>Эрих Кох.</b>\n\n"
         "<b>Как оценить этот документ?</b>"
     )
-    kb = [
-        [InlineKeyboardButton("📌 30 марта ящики здесь — что случилось за 10 дней?", callback_data="b2_good")],
-        [InlineKeyboardButton("❓ «Г.» — не обязательно Кох, ненадёжно", callback_data="b2_bad")],
-    ]
+    text += (
+        "\n\n"
+        "1️⃣ Это подтверждает: 30 марта ящики в замке — ищем что изменилось за 10 дней до капитуляции\n"
+        "2️⃣ «Г.» — не обязательно Кох. Документ ненадёжен, нужны более твёрдые улики"
+    )
+    kb = [[
+        InlineKeyboardButton("1", callback_data="b2_good"),
+        InlineKeyboardButton("2", callback_data="b2_bad"),
+    ]]
     await send(cq, context, text, kb)
 
 
@@ -628,7 +669,7 @@ async def scene_b3(cq, context):
         "советскому полковнику. Пожар начался уже ПОСЛЕ.</i>"
     )
     kb = [[InlineKeyboardButton("К главной развилке →", callback_data="scene_r2")]]
-    await send(cq, context, text, kb)
+    await send(cq, context, text, kb, IMAGES["feyerabend"])
 
 
 # ── ГЛАВНАЯ РАЗВИЛКА Р2 ──────────────────
@@ -650,13 +691,21 @@ async def scene_r2(cq, context):
         "— Майор Волков\n\n"
         "<b>Выдвини свою версию:</b>"
     )
-    kb = [
-        [InlineKeyboardButton("🏰 Бункеры Кёнигсберга", callback_data="ending_A")],
-        [InlineKeyboardButton("⛏ Шахты Тюрингии", callback_data="ending_B")],
-        [InlineKeyboardButton("🌊 Пароход в Балтике", callback_data="ending_C")],
-        [InlineKeyboardButton("🤝 СССР передал США (версия Мосякина)", callback_data="ending_D")],
-        [InlineKeyboardButton("🔥 Сгорела — версия Роде", callback_data="ending_E")],
-    ]
+    text += (
+        "\n\n"
+        "1️⃣ Комната спрятана в подземных бункерах Кёнигсберга\n"
+        "2️⃣ Вывезена в соляные шахты Тюрингии\n"
+        "3️⃣ Погружена на корабль — затонула в Балтийском море\n"
+        "4️⃣ Захвачена советскими войсками и передана США (версия Мосякина)\n"
+        "5️⃣ Уничтожена в пожаре — версия Роде"
+    )
+    kb = [[
+        InlineKeyboardButton("1", callback_data="ending_A"),
+        InlineKeyboardButton("2", callback_data="ending_B"),
+        InlineKeyboardButton("3", callback_data="ending_C"),
+        InlineKeyboardButton("4", callback_data="ending_D"),
+        InlineKeyboardButton("5", callback_data="ending_E"),
+    ]]
     await send(cq, context, text, kb, IMAGES["amber_panel"])
 
 
@@ -752,8 +801,14 @@ async def scene_ending(cq, context, key: str):
     e = ENDINGS[key]
     text = f"⭐ <b>{e['title']}</b>\n{e['cred']}\n\n{e['body']}"
     kb = [[InlineKeyboardButton("Финальный квиз →", callback_data="quiz4_intro")]]
-    photo = IMAGES["restored"] if key in ("A", "D") else None
-    await send(cq, context, text, kb, photo)
+    photo_map = {
+        "A": IMAGES["bunker"],
+        "B": IMAGES["salt_mine"],
+        "C": IMAGES["ship_wreck"],
+        "D": IMAGES["secret_files"],
+        "E": IMAGES["interrogation"],
+    }
+    await send(cq, context, text, kb, photo_map.get(key))
 
 
 async def scene_quiz4_intro(cq, context):
